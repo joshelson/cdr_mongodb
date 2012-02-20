@@ -1,5 +1,5 @@
 /*
- * asterisk_mongodb_cdr.c
+ * cdr_mongodb.c
  *
  * Copyright 2010 Flavio [FlaPer87] Percoco Premoli <flaper87@flaper87.org>
  *
@@ -58,15 +58,16 @@ static char *desc = "MongoDB CDR Backend";
 static char *name = "mongodb";
 static char *config = "cdr_mongodb.conf";
 
-static struct ast_str *hostname = NULL, *dbname = NULL, *dbuser = NULL, *password = NULL, *dbcollection = NULL;
+/* Allow spaces or commas as delimiters for customfields */
+static char delimiters[] = " ,";
+
+static struct ast_str *hostname = NULL, *dbname = NULL, *dbuser = NULL, *password = NULL, *dbcollection = NULL, *customfields = NULL;
 
 static int dbport = 0;
 static int connected = 0;
 static int records = 0;
 static int totalrecords = 0;
-
-static int loguniqueid = 0;
-static int loguserfield = 0;
+static int hasCustomFields = 0; 
 
 AST_MUTEX_DEFINE_STATIC(mongodb_lock);
 
@@ -77,7 +78,7 @@ struct unload_string {
 
 static AST_LIST_HEAD_STATIC(unload_strings, unload_string);
 
-static int internal_bson_append_date(bson_buffer * bb, const char *name, struct timeval when)
+static int internal_bson_append_date(bson * bb, const char *name, struct timeval when)
 {
 	char tmp[128] = "";
 	struct ast_tm tm;
@@ -97,21 +98,39 @@ static int internal_bson_append_date(bson_buffer * bb, const char *name, struct 
 static int _unload_module(int reload)
 {
 	ast_cdr_unregister(name);
+	
+	if (hostname) {
+		ast_free(hostname);	
+	}
+	if (dbname) {
+		ast_free(dbname);	
+	}
+	if (dbuser) {
+		ast_free(dbuser);	
+	}
+	if (password) {
+		ast_free(password);	
+	}
+	if (dbcollection) {
+		ast_free(dbcollection);	
+	}
+	if (customfields) {
+		ast_free(customfields);	
+	}
+	
 	return 0;
 }
 
 static int mongodb_log(struct ast_cdr *cdr)
 {
 	const char * ns;
-	mongo_connection conn[1];
-	mongo_connection_options opts;
-
+	char *result = NULL;
+	char buf[257], *value;
+	mongo conn[1];
+	mongo_error_t status;	
 
 	ast_debug(1, "mongodb: Starting mongodb_log.\n");
-	ast_copy_string(opts.host, ast_str_buffer(hostname), 255);
-	opts.host[254] = '\0';
-	opts.port = dbport;
-
+	ast_debug(1, "mongodb: Connecting to host == %s\n", ast_str_buffer(hostname));
 
 	ast_debug(1, "mongodb: Building mongodb ns.\n");
 	strcpy(&ns, ast_str_buffer(dbname));
@@ -120,84 +139,93 @@ static int mongodb_log(struct ast_cdr *cdr)
 	strcat(&ns, ast_str_buffer(dbcollection));
 	ast_debug(1, "mongodb: ns == %s.\n", &ns);
 
-	if (mongo_connect( conn , &opts )){
-		ast_log(LOG_ERROR, "Method: mongodb_log, MongoDB failed to connect.\n");
+	status = mongo_connect( conn , ast_str_buffer(hostname), dbport );
+	
+	if ( status != MONGO_OK ){
 		connected = 0;
 		records = 0;
+		ast_log(LOG_ERROR, "Method: mongodb_log, unable to connect to MongoDB.\n" );
+
+			switch ( conn->err ) {
+	            	case MONGO_CONN_SUCCESS:      ast_debug(1, "connection succeeded\n" ); break;
+	              	case MONGO_CONN_NO_SOCKET:    ast_debug(1, "no socket\n" ); return -1;
+	              	case MONGO_CONN_FAIL:         ast_debug(1, "connection failed\n" ); return -1;
+	             	case MONGO_CONN_ADDR_FAIL:    ast_debug(1, "error while calling getaddrinfo\n" ); return -1;
+	              	case MONGO_CONN_NOT_MASTER:   ast_debug(1, "not master\n" ); return -1;
+	              	case MONGO_CONN_BAD_SET_NAME: ast_debug(1, "given name doesn't match replica set\n" ); return -1;
+	              	case MONGO_CONN_NO_PRIMARY:   ast_debug(1, "can't find primary in replica set\n" ); return -1;
+			}
+
 		return -1;
 	}
 
 	ast_debug(1, "mongodb: Locking mongodb_lock.\n");
 	ast_mutex_lock(&mongodb_lock);
 
-	ast_debug(1, "mongodb: Got connection, Preparing record.\n");
+	ast_debug(1, "mongodb: Got connection lock, Preparing record.\n");
 
-	bson_buffer bb;
-	bson b;
+	bson bb[1];
 	mongo_cursor * cursor;
 
-	ast_debug(1, "mongodb: Init bb buffer.\n");
-	bson_buffer_init( & bb );
+	/* Init the bson buffer */
+	bson_init( bb );
 	bson_append_new_oid( &bb, "_id" );
 
-	ast_debug(1, "mongodb: accountcode.\n");
 	bson_append_string( &bb , "accountcode",  cdr->accountcode);
 
-	ast_debug(1, "mongodb: src.\n");
 	bson_append_string( &bb , "src",  cdr->src);
 
-	ast_debug(1, "mongodb: dst.\n");
 	bson_append_string( &bb, "dst" , cdr->dst );
 
-	ast_debug(1, "mongodb: dcontext.\n");
 	bson_append_string( &bb, "dcontext" , cdr->dcontext );
 
-	ast_debug(1, "mongodb: clid.\n");
 	bson_append_string( &bb, "clid" , cdr->clid );
 
-	ast_debug(1, "mongodb: channel.\n");
 	bson_append_string( &bb, "channel" , cdr->channel );
 
-	ast_debug(1, "mongodb: dstchannel.\n");
 	bson_append_string( &bb, "dstchannel" , cdr->dstchannel );
 
-	ast_debug(1, "mongodb: lastapp.\n");
 	bson_append_string( &bb, "lastapp" , cdr->lastapp );
 
-	ast_debug(1, "mongodb: lastdata.\n");
 	bson_append_string( &bb, "lastdata" , cdr->lastdata );
 
-	ast_debug(1, "mongodb: start.\n");
 	internal_bson_append_date( &bb, "start" , cdr->start );
 
-	ast_debug(1, "mongodb: answer.\n");
 	internal_bson_append_date( &bb, "answer" , cdr->answer );
 
-	ast_debug(1, "mongodb: end.\n");
 	internal_bson_append_date( &bb, "end" , cdr->end );
 
-	ast_debug(1, "mongodb: duration.\n");
 	bson_append_int( &bb, "duration" , cdr->duration );
 
-	ast_debug(1, "mongodb: billsec.\n");
 	bson_append_int( &bb, "billsec" , cdr->billsec );
 
-	ast_debug(1, "mongodb: disposition.\n");
 	bson_append_string( &bb, "disposition" , ast_cdr_disp2str(cdr->disposition) );
 
-	ast_debug(1, "mongodb: amaflags.\n");
 	bson_append_string( &bb, "amaflags" , ast_cdr_flags2str(cdr->amaflags) );
 
-	ast_debug(1, "mongodb: uniqueid.\n");
 	bson_append_string( &bb, "uniqueid" , cdr->uniqueid );
 
-	ast_debug(1, "mongodb: userfield.\n");
 	bson_append_string( &bb, "userfield" , cdr->userfield );
 
+	/* Read in special values! */
+	if ( hasCustomFields = 1 ) {
+		/* Split custom fields string into array */
+		result = strtok( ast_str_buffer(customfields), delimiters );
+		while( result != NULL ) {
+			ast_cdr_getvar( cdr, result, &value, buf, sizeof(buf), 0, 0 );
+			if ( !ast_strlen_zero( value ) ) {
+				ast_debug(1, "mongodb: Custom CDR entry %s for %s\n", result, value);
+				bson_append_string ( &bb, result, value );
+			}
+		result = strtok( NULL, delimiters );
+		}
+	}
+
+	bson_finish(bb);
+
 	ast_debug(1, "mongodb: Inserting a CDR record.\n");
-	bson_from_buffer(&b, &bb);
-	mongo_insert( conn , &ns , &b );
-	bson_destroy(&b);
+	mongo_insert( conn , &ns, bb );
+	bson_destroy( &bb );
 	mongo_destroy( conn );
 
 	connected = 1;
@@ -205,7 +233,7 @@ static int mongodb_log(struct ast_cdr *cdr)
 	totalrecords++;
 
 	ast_debug(1, "Unlocking mongodb_lock.\n");
-	ast_mutex_unlock(&mongodb_lock);
+	ast_mutex_unlock( &mongodb_lock );
 	return 0;
 }
 
@@ -305,10 +333,11 @@ static int _load_module(int reload)
 	struct ast_variable *var;
 	struct ast_flags config_flags = { reload ? CONFIG_FLAG_FILEUNCHANGED : 0 };
 
-	mongo_connection conn[1];
-	mongo_connection_options opts;
-	bson_buffer bb;
-	bson b;
+	const char * host;
+	
+	mongo conn[1];
+	mongo_error_t status;
+	bson bb;
 	mongo_cursor * cursor;
 
 	ast_debug(1, "Starting mongodb module load.\n");
@@ -320,7 +349,6 @@ static int _load_module(int reload)
 	} else if (cfg == CONFIG_STATUS_FILEUNCHANGED) {
 		return AST_MODULE_LOAD_SUCCESS;
 	}
-
 
 	if (reload) {
 		_unload_module(1);
@@ -340,6 +368,8 @@ static int _load_module(int reload)
 	res |= load_config_string(cfg, "global", "collection", &dbcollection, "cdr");
 	res |= load_config_string(cfg, "global", "password", &password, "");
 	res |= load_config_number(cfg, "global", "port", &dbport, 27017);
+	res |= load_config_string(cfg, "global", "customfields", &customfields, "");
+
 
 	if (res < 0) {
 		return AST_MODULE_LOAD_FAILURE;
@@ -351,16 +381,30 @@ static int _load_module(int reload)
 	ast_debug(1, "Got dbname of %s\n", ast_str_buffer(dbname));
 	ast_debug(1, "Got dbcollection of %s\n", ast_str_buffer(dbcollection));
 	ast_debug(1, "Got password of %s\n", ast_str_buffer(password));
+	
+	/* See if we should be looking for custom fields */
+	if (!ast_strlen_zero( ast_str_buffer(customfields) ) ) {
+		ast_debug(1, "Got custom field list of %s\n", ast_str_buffer(customfields));
+		hasCustomFields = 1;
+	}
 
+	ast_copy_string(&host, ast_str_buffer(hostname), 255);
 
-	ast_copy_string(opts.host, ast_str_buffer(hostname), 255);
-	opts.host[254] = '\0';
-	opts.port = dbport;
+	status = mongo_connect( conn , &host, dbport );	
 
-	if (mongo_connect( conn , &opts )){
-		ast_log(LOG_ERROR, "Method: _load_module, MongoDB failed to connect\n");
-		res = -1;
-	} else {
+	if( status != MONGO_OK ) {
+		switch ( conn->err ) {
+		      	case MONGO_CONN_SUCCESS:      ast_debug(1, "connection succeeded\n" ); break;
+              	case MONGO_CONN_NO_SOCKET:    ast_debug(1, "no socket\n" ); res = -1;
+              	case MONGO_CONN_FAIL:         ast_debug(1, "connection failed\n" ); res = -1;
+             	case MONGO_CONN_ADDR_FAIL:    ast_debug(1, "error while calling getaddrinfo\n" ); res = -1;
+              	case MONGO_CONN_NOT_MASTER:   ast_debug(1, "not master\n" ); res = -1;
+              	case MONGO_CONN_BAD_SET_NAME: ast_debug(1, "given name doesn't match replica set\n" ); res = -1;
+              	case MONGO_CONN_NO_PRIMARY:   ast_debug(1, "can't find primary in replica set\n" ); res = -1;
+	      }
+	}
+	else {
+		ast_log(LOG_NOTICE, "Method: _load_module, MongoDB connected successfully\n");
 		connected = 1;
 		mongo_destroy( conn );
 	}
@@ -397,4 +441,4 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, "MongoDB CDR Backend",
 	.load = load_module,
 	.unload = unload_module,
 	.reload = reload,
-		);
+);

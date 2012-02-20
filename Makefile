@@ -25,13 +25,14 @@ CFLAGS_cdr_mongodb.so = \
 	-I/usr/include/ \
 	-I/usr/local/include/ \
 	-I/opt/asterisk/include/ \
+	-I/usr/src/monco-c-driver/src \
 	-I../mongo-c-driver/src/
 CPPFLAGS_cdr_mongodb.so = 
 OBJS_cdr_mongodb.so =  \
 	$(TARGETDIR_cdr_mongodb.so)/cdr_mongodb.o
 
 # Link or archive
-SHAREDLIB_FLAGS_cdr_mongodb.so = -shared -Xlinker -x -Wl,--hash-style=gnu -Wl,--as-needed -rdynamic
+SHAREDLIB_FLAGS_cdr_mongodb.so = -shared -Xlinker -x -Wl,--hash-style=gnu -Wl,--as-needed -rdynamic -L /usr/src/mongo-c-driver
 LDLIBS_cdr_mongodb.so = -lbson -lmongoc
 $(TARGETDIR_cdr_mongodb.so)/cdr_mongodb.so: $(TARGETDIR_cdr_mongodb.so) $(OBJS_cdr_mongodb.so) $(DEPLIBS_cdr_mongodb.so)
 	$(LINK.c) $(CFLAGS_cdr_mongodb.so) $(CPPFLAGS_cdr_mongodb.so) -o $@ $(OBJS_cdr_mongodb.so) $(SHAREDLIB_FLAGS_cdr_mongodb.so) $(LDLIBS_cdr_mongodb.so)
